@@ -27,6 +27,8 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from srf_attention import Attention
+
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from ...modeling_utils import PreTrainedModel
@@ -282,7 +284,11 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.attn = Attention(d=self.head_dim, n_features=self.head_dim, causal=True, device=next(self.o_proj.parameters()).device)
         self._init_rope()
+
+    def use_fast_attn_(self, use_fast_attn=True):
+        self.use_fast_attn = use_fast_attn
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -368,24 +374,28 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if not self.use_fast_attn:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask
+
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+        else:
+            attn_weights = None
+            attn_output = self.attn(query_states, key_states, value_states, mode='train' if self.training else 'inference', attn_fn='torch', chunk_size=int(os.environ['TILE_SIZE']))
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
