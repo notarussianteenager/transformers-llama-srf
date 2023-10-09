@@ -27,7 +27,10 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from srf_attention import Attention
+try:
+    from srf_attention import Attention
+except:
+    raise ImportError("srf_attention is not installed. Install with `pip install git+https://github.com/notarussianteenager/srf-attention`.")
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
